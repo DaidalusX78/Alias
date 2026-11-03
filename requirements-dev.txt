@@ -1,0 +1,5 @@
+# Development, testing, and build dependencies for Alias
+-r requirements.txt
+pyinstaller>=6.0.0
+pytest>=8.0.0
+ruff>=0.4.0

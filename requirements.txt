@@ -1,0 +1,6 @@
+# Runtime dependencies for Alias
+customtkinter>=5.2.0
+guessit>=3.8.0
+mutagen>=1.47.0
+requests>=2.31.0
+darkdetect>=0.8.0
