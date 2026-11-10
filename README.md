@@ -132,3 +132,4 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 **Author:** Marc Bailey (2026)  
 **Repository:** [https://github.com/DaidalusX78/Alias](https://github.com/DaidalusX78/Alias)
+
