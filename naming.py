@@ -98,19 +98,27 @@ def extract_special_tags(*sources: str) -> list[str]:
     # 1. Edition / Cut (tight boundaries so bare 'extended' doesn't match ordinary titles)
     if re.search(r"\b(extended[\s._-]director\'?s?[\s._-]cut)\b", text, re.IGNORECASE):
         tags.append("Extended Directors Cut")
-    elif re.search(r"\b(director\'?s?[\s._-]cut)\b", text, re.IGNORECASE):
+    elif re.search(
+        r"\b(director\'?s?[\s._-]cut|montaje[\s._-]del[\s._-]director|versi[oó]n[\s._-]del[\s._-]director)\b",
+        text,
+        re.IGNORECASE,
+    ):
         tags.append("Directors Cut")
-    elif re.search(r"\b(final[\s._-]cut)\b", text, re.IGNORECASE):
+    elif re.search(r"\b(final[\s._-]cut|montaje[\s._-]final)\b", text, re.IGNORECASE):
         tags.append("Final Cut")
-    elif re.search(r"\b(extended[\s._-]cut|extended[\s._-]edition)\b", text, re.IGNORECASE):
+    elif re.search(
+        r"\b(extended[\s._-]cut|extended[\s._-]edition|versi[oó]n[\s._-]extendida|edici[oó]n[\s._-]extendida)\b",
+        text,
+        re.IGNORECASE,
+    ):
         tags.append("Extended Cut")
-    elif re.search(r"\b(theatrical[\s._-]cut)\b", text, re.IGNORECASE):
+    elif re.search(r"\b(theatrical[\s._-]cut|versi[oó]n[\s._-]de[\s._-]cine)\b", text, re.IGNORECASE):
         tags.append("Theatrical Cut")
-    elif re.search(r"\b(unrated)\b", text, re.IGNORECASE):
+    elif re.search(r"\b(unrated|sin[\s._-]censura)\b", text, re.IGNORECASE):
         tags.append("Unrated")
-    elif re.search(r"\b(special[\s._-]edition)\b", text, re.IGNORECASE):
+    elif re.search(r"\b(special[\s._-]edition|edici[oó]n[\s._-]especial)\b", text, re.IGNORECASE):
         tags.append("Special Edition")
-    elif re.search(r"\b(remastered)\b", text, re.IGNORECASE):
+    elif re.search(r"\b(remastered|remasterizada?)\b", text, re.IGNORECASE):
         tags.append("Remastered")
 
     # 2. 3D & 3D Formats
@@ -152,16 +160,16 @@ def find_changing_digit_ranges(orig: str, new: str) -> list[tuple[int, int]]:
 
 
 def resolve_audio_name(filepath: Path, audiodb_client: Any = None) -> str:
-    """Extract ID3/Vorbis tags: Artist - Track - Title.ext, enriched with TheAudioDB if available."""
+    """Extract ID3/Vorbis tags: [Artist - ]Track - Title.ext, enriched with TheAudioDB if available."""
     try:
         audio = MutagenFile(filepath, easy=True)
-        if audio and "title" in audio and "artist" in audio:
-            artist = audio["artist"][0]
+        if audio and "title" in audio:
             title = audio["title"][0]
+            artist = audio["artist"][0] if "artist" in audio else ""
             track_list = audio.get("tracknumber", [""])
             track = track_list[0].split("/")[0].zfill(2) if track_list[0] else ""
 
-            if audiodb_client:
+            if audiodb_client and artist:
                 db_track = audiodb_client.search_track(artist, title)
                 if db_track:
                     artist = db_track.get("strArtist", artist)
@@ -169,21 +177,115 @@ def resolve_audio_name(filepath: Path, audiodb_client: Any = None) -> str:
                     if not track and db_track.get("intTrackNumber"):
                         track = str(db_track["intTrackNumber"]).zfill(2)
 
-            if track:
-                new_str = f"{artist} - {track} - {title}{filepath.suffix}"
+            title = capitalize_title(title)
+            if artist:
+                artist = capitalize_title(artist)
+
+            # Check if artist is already part of the parent folder structure (e.g. Music/Queen/Album or Queen - Album)
+            parent_name = filepath.parent.name.lower()
+            grandparent_name = filepath.parent.parent.name.lower() if filepath.parent.parent != filepath.parent else ""
+            artist_in_path = bool(artist and (artist.lower() in parent_name or artist.lower() in grandparent_name))
+
+            if artist and not artist_in_path:
+                if track:
+                    new_str = f"{artist} - {track} - {title}{filepath.suffix}"
+                else:
+                    new_str = f"{artist} - {title}{filepath.suffix}"
             else:
-                new_str = f"{artist} - {title}{filepath.suffix}"
+                # Standard album folder format (Plex/Kodi/iTunes recommendation: 01 - Title.ext)
+                if track:
+                    new_str = f"{track} - {title}{filepath.suffix}"
+                else:
+                    new_str = f"{title}{filepath.suffix}"
             return sanitize_filename(new_str)
     except Exception:
         pass
     return filepath.name
 
 
+LOWERCASE_WORDS = {
+    # English
+    "a", "an", "the", "and", "but", "or", "for", "nor", "on", "at", "to",
+    "from", "by", "with", "in", "of",
+    # Spanish
+    "de", "del", "la", "las", "los", "el", "al", "y", "e", "o", "u",
+    "en", "por", "para", "con", "sin", "un", "una", "unos", "unas", "que",
+}
+
+ROMAN_NUMERALS = {"ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii"}
+
+
+def capitalize_word(w: str) -> str:
+    if not w:
+        return ""
+    if "-" in w and not w.startswith("-"):
+        return "-".join(capitalize_word(part) for part in w.split("-"))
+    if w.lower() in ROMAN_NUMERALS:
+        return w.upper()
+    if any(c.isdigit() for c in w):
+        return w
+    return w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper()
+
+
+def capitalize_title(title: str) -> str:
+    """
+    Applies consistent title casing across English and Spanish titles.
+    Preserves lowercase articles/prepositions unless at segment boundary or start.
+    Preserves uppercase Roman numerals (e.g. II, III, IV).
+    """
+    if not title:
+        return ""
+    segments = re.split(r"(\s*[-:]\s*)", title)
+    result_segments = []
+    for seg in segments:
+        if re.match(r"^\s*[-:]\s*$", seg):
+            result_segments.append(seg)
+            continue
+        words = seg.split(" ")
+        capped = []
+        for i, w in enumerate(words):
+            if not w:
+                capped.append(w)
+                continue
+            w_lower = w.lower()
+            if i == 0:
+                capped.append(capitalize_word(w))
+            elif w_lower in LOWERCASE_WORDS:
+                capped.append(w_lower)
+            else:
+                capped.append(capitalize_word(w))
+        result_segments.append(" ".join(capped))
+    return "".join(result_segments)
+
+
+def extract_full_title(guess: dict[str, Any], fallback_stem: str) -> str:
+    """Extracts the base title and any franchise subtitles / chapters from guessit dict."""
+    raw_title = guess.get("title", fallback_stem)
+    title = raw_title[0] if isinstance(raw_title, list) else str(raw_title)
+
+    # Clean web/pirate release prefixes (e.g. 'Ver Madagascar' -> 'Madagascar')
+    title = re.sub(r"^(?:ver|pel[ií]cula|descargar)\s+[-_.]?\s*", "", title, flags=re.IGNORECASE).strip()
+
+    raw_alt = guess.get("alternative_title")
+    alt_parts: list[str] = []
+    if raw_alt:
+        if isinstance(raw_alt, list):
+            alt_parts = [str(a).strip() for a in raw_alt if str(a).strip()]
+        elif str(raw_alt).strip():
+            alt_parts = [str(raw_alt).strip()]
+
+    # Filter out edition cuts that should be formatted as bracketed tags instead of part of title
+    valid_alt_parts = [p for p in alt_parts if not extract_special_tags(p)]
+    if valid_alt_parts:
+        title = f"{title} - {' - '.join(valid_alt_parts)}"
+
+    return title
+
+
 def resolve_video_name(filepath: Path, tmdb_client: Any = None, tvmaze_client: Any = None) -> str:
     """Extract metadata using guessit, enriched via TVMaze (free) or TMDb when configured."""
     guess = safe_guessit(filepath.name)
-    raw_title = guess.get("title", filepath.stem)
-    title = raw_title[0] if isinstance(raw_title, list) else str(raw_title)
+    title = extract_full_title(guess, filepath.stem)
 
     # TV Episode handling
     if "season" in guess and "episode" in guess:
@@ -208,7 +310,14 @@ def resolve_video_name(filepath: Path, tmdb_client: Any = None, tvmaze_client: A
         if tmdb_client and tmdb_client.is_configured():
             show_data = tmdb_client.search_tv_show(title)
             if show_data:
-                title = show_data.get("name", title)
+                orig_name = show_data.get("original_name", "")
+                orig_lang = show_data.get("original_language", "")
+
+                if orig_lang == "es" and orig_name:
+                    title = orig_name
+                else:
+                    title = show_data.get("name", title)
+
                 ep_data = tmdb_client.get_episode_details(show_data["id"], season, first_ep)
                 if ep_data and ep_data.get("name"):
                     ep_title = ep_data["name"]
@@ -222,6 +331,9 @@ def resolve_video_name(filepath: Path, tmdb_client: Any = None, tvmaze_client: A
                 if tvm_title:
                     ep_title = tvm_title
 
+        title = capitalize_title(title)
+        if ep_title:
+            ep_title = capitalize_title(ep_title)
         sub_part = f" - {ep_title}" if ep_title else ""
         return sanitize_filename(f"{title} - S{s_pad}E{e_pad}{sub_part}{filepath.suffix}")
 
@@ -231,10 +343,30 @@ def resolve_video_name(filepath: Path, tmdb_client: Any = None, tvmaze_client: A
     if tmdb_client and tmdb_client.is_configured():
         movie_data = tmdb_client.search_movie(title, year if year else None)
         if movie_data:
-            title = movie_data.get("title", title)
             rel_date = movie_data.get("release_date", "")
-            if rel_date and len(rel_date) >= 4:
-                year = rel_date[:4]
+            match_year = rel_date[:4] if (rel_date and len(rel_date) >= 4) else ""
+            # Only adopt TMDb metadata if the years are compatible (within 2 years) or if no original year was known
+            year_compatible = True
+            if year and match_year:
+                try:
+                    if abs(int(year) - int(match_year)) > 2:
+                        year_compatible = False
+                except ValueError:
+                    pass
+
+            if year_compatible:
+                orig_title = movie_data.get("original_title", "")
+                orig_lang = movie_data.get("original_language", "")
+
+                if orig_lang == "es" and orig_title:
+                    title = orig_title
+                else:
+                    title = movie_data.get("title", title)
+
+                if match_year:
+                    year = match_year
+
+    title = capitalize_title(title)
 
     # Check tags on both file and immediate parent folder (if single movie folder)
     tags = extract_special_tags(filepath.stem, filepath.parent.name)
@@ -299,8 +431,7 @@ def resolve_folder_name(
     for v_path, _, _ in candidates:
         guess = safe_guessit(v_path.name)
         if "season" in guess or "episode" in guess:
-            raw_title = guess.get("title", "")
-            title = raw_title[0] if isinstance(raw_title, list) else str(raw_title)
+            title = extract_full_title(guess, v_path.stem)
 
             s_val = guess.get("season")
             season = None
@@ -343,9 +474,14 @@ def resolve_folder_name(
             or (show_title and parent_name.lower() in show_title.lower())
         )
 
+        # Season folder naming (supports Spanish 'Temporada' and English 'Season')
+        is_spanish_named = bool(re.match(r"^temporada\s+\d+", folder_path.name, re.IGNORECASE))
+        is_spanish_pref = getattr(tmdb_client, "language", "en-US").startswith("es") if tmdb_client else False
+
         # Single season subfolder
         if len(seasons) == 1 and (has_ep_tag or is_subfolder_of_show):
-            target_season_name = f"Season {seasons[0]}"
+            season_word = "Temporada" if (is_spanish_named or is_spanish_pref) else "Season"
+            target_season_name = f"{season_word} {seasons[0]}"
             target_path = folder_path.parent / target_season_name
             # If target Season N already exists on disk and is a DIFFERENT folder, skip to avoid Season N_1!
             if is_collision(target_path, folder_path):
@@ -354,9 +490,11 @@ def resolve_folder_name(
 
         # Multiple seasons
         if len(seasons) > 1 and (has_ep_tag or is_subfolder_of_show):
-            return f"Seasons {min(seasons)}-{max(seasons)}", False
+            seasons_word = "Temporadas" if (is_spanish_named or is_spanish_pref) else "Seasons"
+            return f"{seasons_word} {min(seasons)}-{max(seasons)}", False
 
         # TV Show root folder itself
+        show_title = capitalize_title(show_title)
         tags = extract_special_tags(folder_path.name)
         tag_str = f" [{' '.join(tags)}]" if tags else ""
         if year:
@@ -371,3 +509,34 @@ def resolve_folder_name(
     tags = extract_special_tags(folder_path.name)
     tag_str = f" [{' '.join(tags)}]" if tags else ""
     return sanitize_filename(f"{folder_path.name}{tag_str}"), False
+
+
+def normalize_duplicate_key(name: str) -> str:
+    """
+    Normalizes a folder or media file name into a canonical grouping key to detect duplicates.
+    Removes file extensions, tags in brackets like [3D H-SBS] or [1080p],
+    annotations like (auto-synced), and collision suffixes like _1, _2, (1), - Copy.
+    Preserves 4-digit release years like (2014) and movie sequel numbers like 'Iron Man 3'.
+    """
+    stem = Path(name).stem if ("." in name and not name.startswith(".")) else name
+
+    # Remove UI annotations
+    stem = re.sub(r"\s*\((auto-synced|create & move into)\)", "", stem, flags=re.IGNORECASE)
+
+    # Remove tags in square brackets e.g. [3D H-SBS], [1080p], [Extended Cut]
+    stem = re.sub(r"\s*\[[^\]]*\]", "", stem)
+
+    # Remove collision suffixes: _1, _2, (1), (2), - Copy, Copy (2), etc.
+    # Note: \d{1,2} ensures 4-digit years like (2014) are NOT stripped!
+    stem = re.sub(
+        r"(_\d+|\s*\(\d{1,2}\)|\s*-\s*copy(\s*\d+)?|\s*copy\s*\d*)$",
+        "",
+        stem,
+        flags=re.IGNORECASE
+    )
+
+    # Normalize internal punctuation and whitespace for robust comparison
+    stem = re.sub(r"[-_.:]", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip().lower()
+    return stem
+

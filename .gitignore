@@ -12,4 +12,10 @@ installer_output/
 # Local User Configurations & Cache
 .alias_renamer_config.json
 .vscode/
+.ruff_cache/
+
+# Private Documentation & Keys
+alias.md
+versions.md
+
 

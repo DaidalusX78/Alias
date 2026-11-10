@@ -2,7 +2,7 @@
 ; Target: Windows 10 / Windows 11 (64-bit)
 
 #define MyAppName "Alias"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.05"
 #define MyAppPublisher "Marc Bailey"
 #define MyAppCopyright "Created by Marc Bailey 2026"
 #define MyAppURL "https://github.com/DaidalusX78/Alias"

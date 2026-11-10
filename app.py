@@ -8,6 +8,7 @@ with intelligent metadata from TMDb, TVMaze, TheAudioDB, and ID3 tags.
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import json
 import os
@@ -36,6 +37,7 @@ from naming import (
     collect_subtitle_files,
     find_changing_digit_ranges,
     is_collision,
+    normalize_duplicate_key,
     pick_primary_video,
     resolve_audio_name,
     resolve_folder_name,
@@ -57,10 +59,30 @@ from winfs import (
     safe_file_or_dir_rename,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.05"
 __author__ = "Marc Bailey"
 
 PAGE_SIZE = 100
+
+# Papaya Orange Accent Theme
+PAPAYA_ACCENT = ("#E65100", "#FF7518")
+PAPAYA_HOVER = ("#CC4400", "#E65814")
+PAPAYA_TEXT = ("#D84315", "#FF8A3D")
+PAPAYA_BADGE_BG = ("#FFE0B2", "#5C2600")
+PAPAYA_BADGE_TEXT = ("#8C3B00", "#FFB27A")
+
+DROPDOWN_THEME = {
+    "fg_color": ("gray82", "gray24"),
+    "button_color": ("gray72", "gray30"),
+    "button_hover_color": ("gray62", "gray40"),
+    "text_color": ("gray10", "gray95"),
+    "dropdown_fg_color": ("gray92", "#1C2128"),
+    "dropdown_hover_color": ("gray80", "#30363D"),
+    "dropdown_text_color": ("gray10", "gray95"),
+    "corner_radius": 6,
+    "font": ("Segoe UI", 12),
+    "dropdown_font": ("Segoe UI", 12),
+}
 
 # Application Styling Setup (load persisted theme if available)
 _init_appearance = "System"
@@ -91,6 +113,8 @@ def get_resource_path(relative_path: str) -> Path:
 class MediaRenamerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        # Prevent CTk from calling withdraw()/deiconify() on titlebar update which causes window focus loss
+        self._deactivate_windows_window_header_manipulation = True
 
         self.title(f"Alias v{__version__} — Smart media renamer | Created by {__author__} 2026")
         self.geometry("1180x760")
@@ -117,6 +141,7 @@ class MediaRenamerApp(ctk.CTk):
 
         # Scanning and UI State
         self._cancel_scan = False
+        self._scan_id = 0
         self._scan_dialog: ScanProgressDialog | None = None
         self.drive_map: dict[str, str] = {}
         self.folder_tree: FolderTreeDropdown | None = None
@@ -130,6 +155,9 @@ class MediaRenamerApp(ctk.CTk):
 
         # Asynchronously detect drives so UI never freezes on network timeout
         self._async_refresh_drives()
+
+        # Bind window minimize/unmap to immediately dismiss any tooltips and open dropdowns
+        self.bind("<Unmap>", self._on_window_unmapped, add="+")
 
         # Handle folder argument passed via command line (e.g. Explorer context menu)
         initial_folder = None
@@ -151,7 +179,19 @@ class MediaRenamerApp(ctk.CTk):
                     if self._scan_dialog:
                         self._scan_dialog.update_progress(curr, total, name)
                 elif msg_type == "scan_finished":
-                    self._on_scan_finished(payload)
+                    scan_id, resolved_data = payload
+                    if scan_id == self._scan_id:
+                        self._on_scan_finished(resolved_data)
+                elif msg_type == "scan_cancelled":
+                    scan_id = payload
+                    if scan_id == self._scan_id:
+                        if self._scan_dialog is not None:
+                            self._scan_dialog.close_dialog()
+                            self._scan_dialog = None
+                        self.lbl_status.configure(text="Scan cancelled. Table cleared.")
+                        self.btn_select.configure(state="normal")
+                        self.btn_load_path.configure(state="normal")
+                        self.btn_rescan.configure(state="normal" if self.selected_folder else "disabled")
                 elif msg_type == "drives_detected":
                     self._apply_detected_drives(payload)
         except queue.Empty:
@@ -169,6 +209,13 @@ class MediaRenamerApp(ctk.CTk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _on_window_unmapped(self, event):
+        """Ensure all popups, tooltips, and dropdowns close when main window is minimized."""
+        if event.widget == self:
+            if getattr(self, "folder_tree", None) and self.folder_tree.is_open():
+                self.folder_tree.close()
+            CTkToolTip.hide_all()
+
     def _apply_detected_drives(self, detected: list[tuple[str, str]]):
         self.drive_map = {label: root for root, label in detected}
         drive_labels = list(self.drive_map.keys()) if self.drive_map else ["No drives found"]
@@ -177,10 +224,20 @@ class MediaRenamerApp(ctk.CTk):
         if current_val not in drive_labels:
             self.opt_drives.set("Select Drive..." if len(drive_labels) > 1 else drive_labels[0])
 
+    @staticmethod
+    def _get_tmdb_language_code(label: str) -> str:
+        if "es-MX" in label or "Latino" in label:
+            return "es-MX"
+        if "es" in label.lower() or "español" in label.lower() or "spanish" in label.lower():
+            return "es-ES"
+        return "en-US"
+
     def _load_saved_config(self):
-        """Load saved TMDb API key (decrypting with Windows DPAPI) and theme preferences."""
+        """Load saved TMDb API key (decrypting with Windows DPAPI), theme, language, and loose file preferences."""
         api_key = os.environ.get("TMDB_API_KEY", "")
         appearance = "System"
+        lang_pref = "English (en-US)"
+        create_folder_pref = True
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -190,21 +247,63 @@ class MediaRenamerApp(ctk.CTk):
                 elif stored_key:
                     api_key = stored_key
                 appearance = data.get("appearance_mode", "System")
+                lang_pref = data.get("metadata_language", "English (en-US)")
+                create_folder_pref = data.get("put_loose_files_in_folders", True)
             except Exception:
                 pass
+        self.opt_language.set(lang_pref)
+        self.var_create_folder.set(create_folder_pref)
+        lang_code = self._get_tmdb_language_code(lang_pref)
         if api_key:
             self.entry_api.insert(0, api_key)
-            self.tmdb_client = TMDbClient(api_key)
+            self.tmdb_client = TMDbClient(api_key, language=lang_code)
+        else:
+            self.tmdb_client.language = lang_code
         self.opt_appearance.set(appearance)
+        ctk.set_appearance_mode(appearance)
+        self.after(50, lambda: self._force_titlebar_theme(appearance))
+
+    def _force_titlebar_theme(self, choice: str):
+        """Immediately update Windows DWM titlebar without disruptive window withdraw/flicker."""
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            mode = choice.lower()
+            if mode == "system":
+                mode = ctk.get_appearance_mode().lower()
+            val = ctypes.c_int(1 if mode == "dark" else 0)
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
+            res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(val), ctypes.sizeof(val)
+            )
+            if res != 0:
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ctypes.byref(val), ctypes.sizeof(val)
+                )
+            SWP_FRAMECHANGED = 0x0020
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+            )
+        except Exception:
+            pass
 
     def _save_config(self):
-        """Persist TMDb API key (encrypted with Windows DPAPI) and theme preferences."""
+        """Persist TMDb API key (encrypted with Windows DPAPI), theme, language, and loose file preferences."""
         try:
             raw_key = self.entry_api.get().strip()
             encrypted_key = encrypt_secret(raw_key) if raw_key else ""
             cfg = {
                 "tmdb_api_key": encrypted_key,
-                "appearance_mode": self.opt_appearance.get()
+                "appearance_mode": self.opt_appearance.get(),
+                "metadata_language": self.opt_language.get(),
+                "put_loose_files_in_folders": self.var_create_folder.get(),
             }
             CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         except Exception:
@@ -212,13 +311,27 @@ class MediaRenamerApp(ctk.CTk):
 
     def _on_appearance_changed(self, choice: str):
         ctk.set_appearance_mode(choice)
+        self._force_titlebar_theme(choice)
         self._save_config()
+        self._apply_filter_and_render()
+
+    def _on_language_changed(self, choice: str):
+        lang_code = self._get_tmdb_language_code(choice)
+        self.tmdb_client.language = lang_code
+        self._save_config()
+        if self.selected_folder:
+            self.rescan_current_folder()
+
+    def _on_create_folder_toggled(self):
+        self._save_config()
+        if self.selected_folder:
+            self.rescan_current_folder()
 
     def _build_ui(self):
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # ----------------- Row 0: Configuration / API Key & Theme -----------------
+        # ----------------- Row 0: Configuration / API Key, Language & Theme -----------------
         self.config_frame = ctk.CTkFrame(self, corner_radius=10)
         self.config_frame.grid(row=0, column=0, padx=20, pady=(15, 5), sticky="ew")
         self.config_frame.grid_columnconfigure(1, weight=1)
@@ -241,31 +354,44 @@ class MediaRenamerApp(ctk.CTk):
             hover_color="gray40",
             command=self._toggle_api_visibility
         )
-        self.btn_toggle_key.grid(row=0, column=2, padx=(5, 10), pady=10)
+        self.btn_toggle_key.grid(row=0, column=2, padx=(5, 8), pady=10)
 
         # Provider Indicators badge (TVMaze & TheAudioDB ready)
         self.lbl_providers = ctk.CTkLabel(
             self.config_frame,
             text="TVMaze: Active  |  TheAudioDB: Active",
             font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("#2EA043", "#3FB950")
+            text_color=PAPAYA_ACCENT
         )
-        self.lbl_providers.grid(row=0, column=3, padx=(4, 12), pady=10)
-        CTkToolTip(self.lbl_providers, "Metadata Providers:\n• TMDb: Active when API key is provided\n• TVMaze: Free public TV metadata (No key required)\n• TheAudioDB: Music metadata & track lookup")
+        self.lbl_providers.grid(row=0, column=3, padx=(4, 8), pady=10)
+
+        # Metadata Language Selector (English, Español, Español Latino)
+        lbl_lang = ctk.CTkLabel(self.config_frame, text="Language:", font=ctk.CTkFont(weight="bold"))
+        lbl_lang.grid(row=0, column=4, padx=(6, 4), pady=10)
+
+        self.opt_language = ctk.CTkOptionMenu(
+            self.config_frame,
+            values=["English (en-US)", "Español (es-ES)", "Español Latino (es-MX)"],
+            command=self._on_language_changed,
+            width=155,
+            **DROPDOWN_THEME
+        )
+        self.opt_language.set("English (en-US)")
+        self.opt_language.grid(row=0, column=5, padx=(0, 8), pady=10)
 
         # Theme Selector (System, Dark, Light)
         lbl_theme = ctk.CTkLabel(self.config_frame, text="Theme:", font=ctk.CTkFont(weight="bold"))
-        lbl_theme.grid(row=0, column=4, padx=(8, 4), pady=10)
+        lbl_theme.grid(row=0, column=6, padx=(6, 4), pady=10)
 
         self.opt_appearance = ctk.CTkOptionMenu(
             self.config_frame,
             values=["System", "Dark", "Light"],
             command=self._on_appearance_changed,
-            width=110
+            width=95,
+            **DROPDOWN_THEME
         )
         self.opt_appearance.set("System")
-        self.opt_appearance.grid(row=0, column=5, padx=(0, 15), pady=10)
-        CTkToolTip(self.opt_appearance, "Theme Mode: Switch between System theme, Dark mode, or Light mode")
+        self.opt_appearance.grid(row=0, column=7, padx=(0, 15), pady=10)
 
         # ----------------- Row 1: Folder Selector & Controls -----------------
         self.top_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -282,7 +408,9 @@ class MediaRenamerApp(ctk.CTk):
             text="Browse Folder...",
             width=130,
             font=ctk.CTkFont(weight="bold"),
-            command=self.choose_directory
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
+            command=self.choose_directory,
         )
         self.btn_select.grid(row=0, column=0, padx=(2, 8), pady=4)
 
@@ -293,7 +421,8 @@ class MediaRenamerApp(ctk.CTk):
             self.controls_subframe,
             values=["Scanning drives..."],
             command=self._on_quick_drive_selected,
-            width=230
+            width=230,
+            **DROPDOWN_THEME
         )
         self.opt_drives.set("Scanning drives...")
         self.opt_drives.grid(row=0, column=2, padx=(0, 14), pady=4)
@@ -305,10 +434,23 @@ class MediaRenamerApp(ctk.CTk):
             self.controls_subframe,
             values=["Media Only (Auto-sync Subs & Folders)", "Edit All Names Individually"],
             command=self._on_edit_mode_changed,
-            width=260
+            width=260,
+            **DROPDOWN_THEME
         )
         self.opt_mode.set("Media Only (Auto-sync Subs & Folders)")
         self.opt_mode.grid(row=0, column=4, padx=(0, 12), pady=4)
+
+        self.var_create_folder = ctk.BooleanVar(value=True)
+        self.chk_create_folder = ctk.CTkCheckBox(
+            self.controls_subframe,
+            text="Put loose files into folders",
+            variable=self.var_create_folder,
+            command=self._on_create_folder_toggled,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
+        )
+        self.chk_create_folder.grid(row=0, column=5, padx=(4, 10), pady=4, sticky="e")
 
         self.var_hide_unchanged = ctk.BooleanVar(value=False)
         self.chk_hide_unchanged = ctk.CTkCheckBox(
@@ -316,9 +458,23 @@ class MediaRenamerApp(ctk.CTk):
             text="Hide unchanged folders and files",
             variable=self.var_hide_unchanged,
             command=self._on_filter_changed,
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
         )
-        self.chk_hide_unchanged.grid(row=0, column=5, padx=8, pady=4, sticky="e")
+        self.chk_hide_unchanged.grid(row=0, column=6, padx=(4, 8), pady=4, sticky="e")
+
+        self.var_show_duplicates = ctk.BooleanVar(value=False)
+        self.chk_show_duplicates = ctk.CTkCheckBox(
+            self.controls_subframe,
+            text="Duplicates only",
+            variable=self.var_show_duplicates,
+            command=self._on_filter_changed,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
+        )
+        self.chk_show_duplicates.grid(row=0, column=7, padx=(4, 8), pady=4, sticky="e")
 
         # Sub-row 1: Direct editable path bar with folder tree dropdown toggle
         self.path_subframe = ctk.CTkFrame(self.top_frame, fg_color="transparent")
@@ -335,25 +491,29 @@ class MediaRenamerApp(ctk.CTk):
         self.entry_path.grid(row=0, column=1, padx=(0, 4), pady=2, sticky="ew")
         self.entry_path.bind("<Return>", lambda e: self.load_entered_path())
 
-        self.folder_tree = FolderTreeDropdown(self, self.entry_path, self._on_tree_folder_selected)
-
         self.btn_tree_toggle = ctk.CTkButton(
             self.path_subframe,
             text="▼",
             width=28,
-            fg_color="gray30",
-            hover_color="gray40",
-            command=self.folder_tree.toggle
+            fg_color=("gray82", "gray24"),
+            hover_color=("gray72", "gray30"),
+            text_color=("gray10", "gray95"),
+            command=lambda: self.folder_tree.toggle()
         )
         self.btn_tree_toggle.grid(row=0, column=2, padx=(0, 8), pady=2)
-        CTkToolTip(self.btn_tree_toggle, "Folder Tree: Click to open/close folder tree browser")
+
+        self.folder_tree = FolderTreeDropdown(
+            self, self.entry_path, self._on_tree_folder_selected, toggle_btn=self.btn_tree_toggle
+        )
 
         self.btn_load_path = ctk.CTkButton(
             self.path_subframe,
             text="Scan / Load",
             width=100,
             font=ctk.CTkFont(weight="bold"),
-            command=self.load_entered_path
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
+            command=self.load_entered_path,
         )
         self.btn_load_path.grid(row=0, column=3, padx=(0, 4), pady=2)
 
@@ -388,7 +548,9 @@ class MediaRenamerApp(ctk.CTk):
             text="",
             width=24,
             variable=self.var_select_all,
-            command=self._toggle_all_checkboxes
+            command=self._toggle_all_checkboxes,
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
         )
         self.chk_select_all.grid(row=0, column=0, padx=(5, 8), sticky="w")
 
@@ -400,10 +562,9 @@ class MediaRenamerApp(ctk.CTk):
             text_color=("gray10", "gray90"),
             hover_color=("gray80", "gray25"),
             font=ctk.CTkFont(weight="bold"),
-            command=self._toggle_sort_by_name
+            command=self._toggle_sort_by_name,
         )
         self.btn_header_name.grid(row=0, column=1, sticky="w", padx=5)
-        CTkToolTip(self.btn_header_name, "Click to sort by Current Name: A-Z, Z-A, or default order")
 
         self.btn_header_type = ctk.CTkButton(
             self.header_frame,
@@ -414,16 +575,15 @@ class MediaRenamerApp(ctk.CTk):
             text_color=("gray10", "gray90"),
             hover_color=("gray80", "gray25"),
             font=ctk.CTkFont(weight="bold"),
-            command=self._toggle_sort_by_type
+            command=self._toggle_sort_by_type,
         )
         self.btn_header_type.grid(row=0, column=2, sticky="w", padx=5)
-        CTkToolTip(self.btn_header_type, "Click to sort by Type: Folders first, Files first, or default order")
 
         self.lbl_header_proposed = ctk.CTkLabel(
             self.header_frame,
             text="Proposed New Name",
             anchor="w",
-            font=ctk.CTkFont(weight="bold")
+            font=ctk.CTkFont(weight="bold"),
         )
         self.lbl_header_proposed.grid(row=0, column=3, sticky="w", padx=5)
 
@@ -436,10 +596,9 @@ class MediaRenamerApp(ctk.CTk):
             text_color=("gray10", "gray90"),
             hover_color=("gray80", "gray25"),
             font=ctk.CTkFont(weight="bold"),
-            command=self._toggle_sort_by_status
+            command=self._toggle_sort_by_status,
         )
         self.btn_header_status.grid(row=0, column=4, sticky="e", padx=(5, 38))
-        CTkToolTip(self.btn_header_status, "Click to sort by Status: Pending first, Unchanged first, or default order")
 
         self.scroll_list = ctk.CTkScrollableFrame(self.table_frame, fg_color="transparent")
         self.scroll_list.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
@@ -469,6 +628,19 @@ class MediaRenamerApp(ctk.CTk):
         self.lbl_page_info = ctk.CTkLabel(self.page_frame, text="", font=ctk.CTkFont(size=12), text_color="gray")
         self.lbl_page_info.grid(row=0, column=1, padx=10)
 
+        self.btn_dedup = ctk.CTkButton(
+            self.page_frame,
+            text="Deselect Duplicates (Keep 1st)",
+            width=190,
+            height=26,
+            state="disabled",
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._deselect_duplicate_copies
+        )
+        self.btn_dedup.grid(row=0, column=2, padx=6)
+
         self.btn_next_page = ctk.CTkButton(
             self.page_frame,
             text="Next Page ▶",
@@ -479,7 +651,7 @@ class MediaRenamerApp(ctk.CTk):
             hover_color="gray40",
             command=self._next_page
         )
-        self.btn_next_page.grid(row=0, column=2, padx=4, sticky="e")
+        self.btn_next_page.grid(row=0, column=3, padx=4, sticky="e")
 
         # ----------------- Row 3: Bottom Action Bar -----------------
         self.bottom_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -511,8 +683,8 @@ class MediaRenamerApp(ctk.CTk):
         self.btn_apply = ctk.CTkButton(
             self.bottom_frame,
             text="Apply Renaming",
-            fg_color="#2EA043",
-            hover_color="#238636",
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
             state="disabled",
             font=ctk.CTkFont(weight="bold"),
             command=self.apply_renames
@@ -608,16 +780,66 @@ class MediaRenamerApp(ctk.CTk):
     def _cancel_active_scan(self):
         self._cancel_scan = True
 
+    def _clear_scan_results(self):
+        """Immediately purge previous scan results and clear the table widgets."""
+        self.file_items = []
+        self.filtered_items = []
+        self.current_page = 0
+        for widget in self.scroll_list.winfo_children():
+            widget.destroy()
+        self.lbl_page_info.configure(text="")
+        self.btn_prev_page.configure(state="disabled")
+        self.btn_next_page.configure(state="disabled")
+        self.btn_apply.configure(state="disabled")
+        if getattr(self, "btn_dedup", None):
+            self.btn_dedup.configure(state="disabled")
+
+    def _deselect_duplicate_copies(self):
+        """
+        Deselect secondary copies within every duplicate group,
+        keeping only the 1st (primary) copy selected for renaming.
+        """
+        seen_groups: set[str] = set()
+        deselected_count = 0
+
+        for item in self.file_items:
+            group = item.get("duplicate_group")
+            if not group or not item.get("is_duplicate"):
+                continue
+
+            if group not in seen_groups:
+                seen_groups.add(group)
+                item["is_selected"] = True
+                if "selected_var" in item and item["selected_var"] is not None:
+                    item["selected_var"].set(True)
+            else:
+                item["is_selected"] = False
+                if "selected_var" in item and item["selected_var"] is not None:
+                    item["selected_var"].set(False)
+                deselected_count += 1
+
+        self._update_selection_status()
+        self._render_current_page()
+
     def rescan_current_folder(self):
         self._async_refresh_drives()
         if not self.selected_folder or not self.selected_folder.exists():
             return
 
+        # 1. Cancel previous scan worker and increment scan generation ID
+        self._cancel_scan = True
+        self._scan_id += 1
+        current_scan_id = self._scan_id
+
+        # 2. Immediately clear previous results so another drive's files never show
+        self._clear_scan_results()
+
         self._save_config()
-        self.tmdb_client = TMDbClient(self.entry_api.get())
+        lang_code = self._get_tmdb_language_code(self.opt_language.get())
+        self.tmdb_client = TMDbClient(self.entry_api.get(), language=lang_code)
         self._cancel_scan = False
 
-        self.lbl_status.configure(text="Scanning folder & querying metadata...")
+        self.lbl_status.configure(text=f"Scanning folder: {self.selected_folder.name}...")
         self.btn_select.configure(state="disabled")
         self.btn_load_path.configure(state="disabled")
         self.btn_rescan.configure(state="disabled")
@@ -627,13 +849,13 @@ class MediaRenamerApp(ctk.CTk):
             self._scan_dialog.close_dialog()
         self._scan_dialog = ScanProgressDialog(self, self.selected_folder, self._cancel_active_scan)
 
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(current_scan_id,), daemon=True).start()
 
-    def _scan_worker(self):
+    def _scan_worker(self, scan_id: int):
         clear_guessit_cache()
         resolved_data = []
         try:
-            if not self.selected_folder:
+            if not self.selected_folder or scan_id != self._scan_id or self._cancel_scan:
                 return
 
             folder = self.selected_folder
@@ -651,14 +873,14 @@ class MediaRenamerApp(ctk.CTk):
                 by_folder.setdefault(path.parent, []).append(path)
 
             for folder_path, media_paths in by_folder.items():
-                if self._cancel_scan:
+                if self._cancel_scan or scan_id != self._scan_id:
                     break
 
                 video_files_in_folder: list[tuple[Path, str, str]] = []
                 audio_files_in_folder: list[tuple[Path, str, str]] = []
 
                 for path in media_paths:
-                    if self._cancel_scan:
+                    if self._cancel_scan or scan_id != self._scan_id:
                         break
 
                     processed_media += 1
@@ -699,11 +921,75 @@ class MediaRenamerApp(ctk.CTk):
                     else:
                         audio_files_in_folder.append((path, Path(new_name).stem, media_item_id))
 
-                if self._cancel_scan:
+                if self._cancel_scan or scan_id != self._scan_id:
                     break
 
-                # Subtitles and folder naming for single-video folder
-                if len(video_files_in_folder) == 1:
+                is_create_folder_enabled = bool(getattr(self, "var_create_folder", None) and self.var_create_folder.get())
+                is_root_scan = bool(self.selected_folder and str(folder_path.resolve()).lower() == str(self.selected_folder.resolve()).lower())
+
+                # Subtitles and folder naming
+                if is_root_scan and is_create_folder_enabled:
+                    # Loose files in the root scanned directory -> Create dedicated folder for each video
+                    srt_files = collect_subtitle_files(folder_path)
+                    for v_path, new_video_stem, v_id in video_files_in_folder:
+                        # Update video item with target folder and mark as active action (move into folder)
+                        for itm in resolved_data:
+                            if itm.get("id") == v_id:
+                                itm["target_folder_name"] = new_video_stem
+                                itm["will_rename"] = True
+                                itm["is_selected"] = True
+                                itm["is_loose_move"] = True
+                                break
+
+                        # Find and attach matching subtitles
+                        v_stem_lower = v_path.stem.lower()
+                        matching_subs = [
+                            s for s in srt_files
+                            if s.stem.lower().startswith(v_stem_lower)
+                            or v_stem_lower.startswith(s.stem.lower())
+                            or len(video_files_in_folder) == 1
+                        ]
+                        for srt in matching_subs:
+                            new_srt_name = resolve_subtitle_name(srt, v_path.stem, new_video_stem, len(matching_subs))
+                            resolved_data.append({
+                                "id": f"item_{len(resolved_data)}",
+                                "kind": "Sub",
+                                "is_dir": False,
+                                "folder_group": folder_path,
+                                "parent_media_id": v_id,
+                                "target_folder_name": new_video_stem,
+                                "old_video_stem": v_path.stem,
+                                "dir_count": len(matching_subs),
+                                "path": srt,
+                                "display_orig": srt.name,
+                                "orig_name": srt.name,
+                                "new_name": new_srt_name,
+                                "will_rename": True,
+                                "is_selected": True,
+                                "is_loose_move": True,
+                            })
+
+                        # Create Folder row to represent the new directory
+                        folder_item = {
+                            "id": f"item_{len(resolved_data)}",
+                            "kind": "Folder",
+                            "is_dir": True,
+                            "is_new_folder": True,
+                            "folder_group": folder_path,
+                            "parent_media_id": v_id,
+                            "is_multi_ep": False,
+                            "path": folder_path / new_video_stem,
+                            "display_orig": "(Create Folder)",
+                            "orig_name": "(Create Folder)",
+                            "new_name": new_video_stem,
+                            "target_folder_name": new_video_stem,
+                            "will_rename": True,
+                            "is_selected": True,
+                            "status_override": "Pending (Create)",
+                        }
+                        resolved_data.append(folder_item)
+
+                elif len(video_files_in_folder) == 1:
                     video_path, new_video_stem, v_id = video_files_in_folder[0]
                     old_video_stem = video_path.stem
 
@@ -734,28 +1020,30 @@ class MediaRenamerApp(ctk.CTk):
                             "is_selected": will_rename_srt,
                         })
 
-                    new_folder_name, collision_skipped = resolve_folder_name(
-                        folder_path, video_files_in_folder, self.tmdb_client, self.tvmaze_client
-                    )
-                    if new_folder_name and folder_path.parent != folder_path:
-                        will_rename_dir = (new_folder_name != folder_path.name) and (not collision_skipped)
-                        folder_item = {
-                            "id": f"item_{len(resolved_data)}",
-                            "kind": "Folder",
-                            "is_dir": True,
-                            "folder_group": folder_path,
-                            "parent_media_id": v_id,
-                            "is_multi_ep": False,
-                            "path": folder_path,
-                            "display_orig": folder_path.name,
-                            "orig_name": folder_path.name,
-                            "new_name": new_folder_name,
-                            "will_rename": will_rename_dir,
-                            "is_selected": will_rename_dir,
-                        }
-                        if collision_skipped:
-                            folder_item["status_override"] = "Skipped (Season exists)"
-                        resolved_data.append(folder_item)
+                    if not is_root_scan:
+                        new_folder_name, collision_skipped = resolve_folder_name(
+                            folder_path, video_files_in_folder, self.tmdb_client, self.tvmaze_client
+                        )
+                        if new_folder_name and folder_path.parent != folder_path:
+                            will_rename_dir = (new_folder_name != folder_path.name) and (not collision_skipped)
+                            folder_item = {
+                                "id": f"item_{len(resolved_data)}",
+                                "kind": "Folder",
+                                "is_dir": True,
+                                "is_new_folder": False,
+                                "folder_group": folder_path,
+                                "parent_media_id": v_id,
+                                "is_multi_ep": False,
+                                "path": folder_path,
+                                "display_orig": folder_path.name,
+                                "orig_name": folder_path.name,
+                                "new_name": new_folder_name,
+                                "will_rename": will_rename_dir,
+                                "is_selected": will_rename_dir,
+                            }
+                            if collision_skipped:
+                                folder_item["status_override"] = "Skipped (Season exists)"
+                            resolved_data.append(folder_item)
 
                 elif len(video_files_in_folder) > 1:
                     primary_path, primary_new_stem, primary_id = pick_primary_video(video_files_in_folder)
@@ -830,13 +1118,61 @@ class MediaRenamerApp(ctk.CTk):
                         resolved_data.append(folder_item)
         finally:
             gc.collect()
-            self.msg_queue.put(("scan_finished", resolved_data))
+            if (not self._cancel_scan) and (scan_id == self._scan_id):
+                self.msg_queue.put(("scan_finished", (scan_id, resolved_data)))
+            else:
+                self.msg_queue.put(("scan_cancelled", scan_id))
+
+    def _detect_duplicates(self, items: list[dict]) -> int:
+        """
+        Group and detect duplicate folders and files across the scanned library.
+        Marks items with is_duplicate, duplicate_count, and duplicate_group.
+        Returns the total count of duplicate items.
+        """
+        groups: dict[tuple[str, str], list[dict]] = {}
+
+        for item in items:
+            kind = item.get("kind", "File")
+            if kind in ("Folder", "NewFolder"):
+                category = "Folder"
+            elif kind in ("Video", "Audio"):
+                category = kind
+            else:
+                item["is_duplicate"] = False
+                item["duplicate_count"] = 0
+                item["duplicate_group"] = ""
+                continue
+
+            name_to_check = item.get("new_name") or item.get("orig_name", "")
+            key = normalize_duplicate_key(name_to_check)
+            if not key:
+                item["is_duplicate"] = False
+                item["duplicate_count"] = 0
+                item["duplicate_group"] = ""
+                continue
+
+            group_id = (category, key)
+            groups.setdefault(group_id, []).append(item)
+
+        dup_items_count = 0
+        for (category, key), group_items in groups.items():
+            is_dup = (len(group_items) > 1)
+            group_label = f"{category}:{key}"
+            for itm in group_items:
+                itm["is_duplicate"] = is_dup
+                itm["duplicate_count"] = len(group_items) if is_dup else 0
+                itm["duplicate_group"] = group_label if is_dup else ""
+                if is_dup:
+                    dup_items_count += 1
+
+        return dup_items_count
 
     def _on_scan_finished(self, resolved_data: list[dict]):
         if self._scan_dialog is not None:
             self._scan_dialog.close_dialog()
             self._scan_dialog = None
 
+        self._detect_duplicates(resolved_data)
         self.file_items = resolved_data
         self.current_page = 0
         self.var_select_all.set(True)
@@ -881,12 +1217,14 @@ class MediaRenamerApp(ctk.CTk):
 
     def _toggle_sort_by_status(self):
         CTkToolTip.hide_all()
-        if self.sort_mode == "status_pending":
+        if self.sort_mode == "status_duplicates":
+            self.sort_mode = "status_pending"
+        elif self.sort_mode == "status_pending":
             self.sort_mode = "status_unchanged"
         elif self.sort_mode == "status_unchanged":
             self.sort_mode = None
         else:
-            self.sort_mode = "status_pending"
+            self.sort_mode = "status_duplicates"
         self._update_sort_button_labels()
         self.current_page = 0
         self._apply_filter_and_render()
@@ -906,7 +1244,9 @@ class MediaRenamerApp(ctk.CTk):
         else:
             self.btn_header_type.configure(text="Type ↕")
 
-        if self.sort_mode == "status_pending":
+        if self.sort_mode == "status_duplicates":
+            self.btn_header_status.configure(text="Status (Duplicates ▲)")
+        elif self.sort_mode == "status_pending":
             self.btn_header_status.configure(text="Status (Pending ▲)")
         elif self.sort_mode == "status_unchanged":
             self.btn_header_status.configure(text="Status (Unchanged ▼)")
@@ -919,7 +1259,9 @@ class MediaRenamerApp(ctk.CTk):
             self._render_current_page()
             return
 
-        if self.var_hide_unchanged.get():
+        if getattr(self, "var_show_duplicates", None) and self.var_show_duplicates.get():
+            items = [item for item in self.file_items if item.get("is_duplicate")]
+        elif self.var_hide_unchanged.get():
             items = [item for item in self.file_items if item["will_rename"]]
         else:
             items = list(self.file_items)
@@ -934,6 +1276,13 @@ class MediaRenamerApp(ctk.CTk):
         elif self.sort_mode == "type_files":
             order_map = {"Video": 0, "Audio": 1, "Sub": 2, "Folder": 3}
             items.sort(key=lambda x: (order_map.get(x["kind"], 9), str(x["path"]).lower()))
+        elif self.sort_mode == "status_duplicates":
+            items.sort(key=lambda x: (
+                0 if x.get("is_duplicate") else 1,
+                x.get("duplicate_group", ""),
+                0 if x.get("kind") in ("Folder", "NewFolder") else 1,
+                str(x.get("orig_name", "")).lower()
+            ))
         elif self.sort_mode == "status_pending":
             items.sort(key=lambda x: (
                 0 if (x["will_rename"] and x["is_selected"]) else (1 if x["will_rename"] else 2),
@@ -974,6 +1323,7 @@ class MediaRenamerApp(ctk.CTk):
             item.pop("label_new", None)
             item.pop("status_label", None)
             item.pop("diff_badge", None)
+            item.pop("dup_badge", None)
 
         self.btn_select.configure(state="normal")
         self.btn_load_path.configure(state="normal")
@@ -1034,7 +1384,9 @@ class MediaRenamerApp(ctk.CTk):
                 width=24,
                 variable=var_chk,
                 state="normal" if item["will_rename"] else "disabled",
-                command=make_chk_handler(item)
+                command=make_chk_handler(item),
+                fg_color=PAPAYA_ACCENT,
+                hover_color=PAPAYA_HOVER,
             )
             chk.grid(row=idx, column=0, padx=(5, 8), pady=4, sticky="w")
             item["chk"] = chk
@@ -1050,8 +1402,8 @@ class MediaRenamerApp(ctk.CTk):
 
             # Column 2: Type badge (Folder, Video, Audio, Sub)
             badge_is_folder = (item["kind"] == "Folder")
-            badge_fg = ("#1f6aa5", "#144870") if badge_is_folder else ("gray80", "gray25")
-            badge_text_color = "white" if badge_is_folder else ("gray10", "gray90")
+            badge_fg = PAPAYA_BADGE_BG if badge_is_folder else ("gray80", "gray25")
+            badge_text_color = PAPAYA_BADGE_TEXT if badge_is_folder else ("gray10", "gray90")
             lbl_type = ctk.CTkLabel(
                 self.scroll_list,
                 text=item["kind"],
@@ -1087,7 +1439,7 @@ class MediaRenamerApp(ctk.CTk):
                     entry_frame,
                     height=28,
                     font=ctk.CTkFont(size=12),
-                    text_color="#58A6FF" if item["will_rename"] else ("gray10", "gray90")
+                    text_color=PAPAYA_TEXT[1] if item["will_rename"] else ("gray10", "gray90")
                 )
                 entry_new.insert(0, item["new_name"])
                 entry_new.grid(row=0, column=col_idx, sticky="ew")
@@ -1100,6 +1452,7 @@ class MediaRenamerApp(ctk.CTk):
                 entry_new.bind("<FocusOut>", make_handler(item))
 
                 # Contrasting pill highlighting changing digits next to the entry
+                pill_col = col_idx + 1
                 if digit_ranges:
                     changed_tokens = [item["new_name"][s:e] for s, e in digit_ranges]
                     diff_text = f"Δ {', '.join(changed_tokens)}"
@@ -1113,9 +1466,34 @@ class MediaRenamerApp(ctk.CTk):
                         padx=6,
                         pady=1
                     )
-                    badge.grid(row=0, column=col_idx + 1, padx=(6, 2), sticky="e")
-                    CTkToolTip(badge, f"Changing digits from original: {', '.join(changed_tokens)}")
+                    badge.grid(row=0, column=pill_col, padx=(6, 2), sticky="e")
                     item["diff_badge"] = badge
+                    pill_col += 1
+
+                if item.get("is_duplicate"):
+                    dup_cnt = item["duplicate_count"]
+                    badge_dup = ctk.CTkLabel(
+                        entry_frame,
+                        text=f"⚠️ Duplicate ({dup_cnt})",
+                        font=ctk.CTkFont(size=11, weight="bold"),
+                        text_color="#FFFFFF",
+                        fg_color=("#D32F2F", "#A31515"),
+                        corner_radius=4,
+                        padx=6,
+                        pady=1
+                    )
+                    badge_dup.grid(row=0, column=pill_col, padx=(4, 2), sticky="e")
+                    item["dup_badge"] = badge_dup
+                    pill_col += 1
+
+                if item.get("is_loose_move") and not item.get("is_new_folder") and (item["orig_name"] == item["new_name"]):
+                    lbl_move = ctk.CTkLabel(
+                        entry_frame,
+                        text="(move into folder)",
+                        font=ctk.CTkFont(size=11, slant="italic"),
+                        text_color=PAPAYA_TEXT[1]
+                    )
+                    lbl_move.grid(row=0, column=pill_col, padx=(4, 2), sticky="e")
             else:
                 # Segmented display highlighting changing digits in contrasting vivid orange
                 seg_box = ctk.CTkFrame(entry_frame, fg_color="transparent")
@@ -1132,7 +1510,7 @@ class MediaRenamerApp(ctk.CTk):
                             ctk.CTkLabel(
                                 seg_box,
                                 text=full_text[last_idx:start],
-                                text_color="#58A6FF",
+                                text_color=PAPAYA_TEXT[1],
                                 font=ctk.CTkFont(size=12)
                             ).pack(side="left")
                         ctk.CTkLabel(
@@ -1148,30 +1526,62 @@ class MediaRenamerApp(ctk.CTk):
                         ctk.CTkLabel(
                             seg_box,
                             text=full_text[last_idx:],
-                            text_color="#58A6FF",
+                            text_color=PAPAYA_TEXT[1],
                             font=ctk.CTkFont(size=12)
                         ).pack(side="left")
                 else:
                     ctk.CTkLabel(
                         seg_box,
                         text=full_text,
-                        text_color="#58A6FF" if item["will_rename"] else "gray",
+                        text_color=PAPAYA_TEXT[1] if item["will_rename"] else "gray",
                         font=ctk.CTkFont(size=12)
                     ).pack(side="left")
 
-                lbl_sync = ctk.CTkLabel(
-                    seg_box,
-                    text="  (auto-synced)",
-                    font=ctk.CTkFont(size=11, slant="italic"),
-                    text_color="gray55"
-                )
+                if item.get("is_new_folder"):
+                    lbl_sync = ctk.CTkLabel(
+                        seg_box,
+                        text="  (create & move into)",
+                        font=ctk.CTkFont(size=11, slant="italic"),
+                        text_color=PAPAYA_TEXT[1]
+                    )
+                else:
+                    lbl_sync = ctk.CTkLabel(
+                        seg_box,
+                        text="  (auto-synced)",
+                        font=ctk.CTkFont(size=11, slant="italic"),
+                        text_color="gray55"
+                    )
                 lbl_sync.pack(side="left")
+
+                if item.get("is_duplicate"):
+                    dup_cnt = item["duplicate_count"]
+                    lbl_dup = ctk.CTkLabel(
+                        seg_box,
+                        text=f"  ⚠️ Duplicate ({dup_cnt})",
+                        font=ctk.CTkFont(size=11, weight="bold"),
+                        text_color="#FF5252"
+                    )
+                    lbl_dup.pack(side="left", padx=4)
+
                 item["label_new"] = seg_box
 
             # Column 4: Status
             if item.get("status_override"):
                 status_text = item["status_override"]
                 status_color = "#E5A00D"
+            elif item.get("is_duplicate"):
+                if item["will_rename"] and item["is_selected"]:
+                    status_text = f"Duplicate ({item['duplicate_count']})"
+                    status_color = "#E55353"
+                else:
+                    status_text = "Duplicate (Skipped)"
+                    status_color = "gray"
+            elif item.get("is_new_folder"):
+                status_text = "Pending (Create)" if item["is_selected"] else "Skipped"
+                status_color = "#D29922" if item["is_selected"] else "gray"
+            elif item.get("is_loose_move"):
+                status_text = "Pending (Move)" if item["is_selected"] else "Skipped"
+                status_color = "#D29922" if item["is_selected"] else "gray"
             elif item["will_rename"] and item["is_selected"]:
                 status_text = "Pending"
                 status_color = "#D29922"
@@ -1199,7 +1609,7 @@ class MediaRenamerApp(ctk.CTk):
 
         edited_val = item["entry_new"].get().strip()
         item["new_name"] = edited_val
-        is_changed = bool(edited_val) and (edited_val != item["orig_name"])
+        is_changed = bool(edited_val) and (edited_val != item["orig_name"] or bool(item.get("target_folder_name")))
         item["will_rename"] = is_changed
         item["is_selected"] = is_changed
 
@@ -1208,10 +1618,10 @@ class MediaRenamerApp(ctk.CTk):
         if item.get("selected_var"):
             item["selected_var"].set(is_changed)
 
-        item["entry_new"].configure(text_color="#58A6FF" if is_changed else ("gray10", "gray90"))
+        item["entry_new"].configure(text_color=PAPAYA_TEXT[1] if (edited_val != item["orig_name"]) else ("gray10", "gray90"))
 
         # Update diff badge
-        digit_ranges = find_changing_digit_ranges(item["orig_name"], edited_val) if is_changed else []
+        digit_ranges = find_changing_digit_ranges(item["orig_name"], edited_val) if (edited_val != item["orig_name"]) else []
         if item.get("diff_badge"):
             if digit_ranges:
                 tokens = [edited_val[s:e] for s, e in digit_ranges]
@@ -1223,9 +1633,13 @@ class MediaRenamerApp(ctk.CTk):
         # In Auto-sync mode, cascade changes from video/audio to subtitles and folders
         if self.opt_mode.get() == "Media Only (Auto-sync Subs & Folders)" and item["kind"] in ("Audio", "Video"):
             new_media_stem = Path(edited_val).stem if edited_val else item["path"].stem
+            if item.get("target_folder_name"):
+                item["target_folder_name"] = sanitize_filename(new_media_stem)
 
             for dep in self.file_items:
                 if dep.get("parent_media_id") == item.get("id"):
+                    if dep.get("target_folder_name"):
+                        dep["target_folder_name"] = sanitize_filename(new_media_stem)
                     if dep["kind"] == "Sub":
                         dep_new_name = resolve_subtitle_name(
                             dep["path"], dep.get("old_video_stem", ""), new_media_stem, dep.get("dir_count", 1)
@@ -1238,19 +1652,20 @@ class MediaRenamerApp(ctk.CTk):
                         continue
 
                     dep["new_name"] = dep_new_name
-                    dep_changed = (dep_new_name != dep["orig_name"])
+                    dep_changed = (dep_new_name != dep["orig_name"]) or bool(dep.get("target_folder_name")) or bool(dep.get("is_new_folder"))
                     dep["will_rename"] = dep_changed
                     dep["is_selected"] = dep_changed
 
                     if "entry_new" in dep:
                         dep["entry_new"].delete(0, "end")
                         dep["entry_new"].insert(0, dep_new_name)
-                        dep["entry_new"].configure(text_color="#58A6FF" if dep_changed else ("gray10", "gray90"))
+                        dep["entry_new"].configure(text_color=PAPAYA_TEXT[1] if (dep_new_name != dep["orig_name"]) else ("gray10", "gray90"))
                     if "chk" in dep:
                         dep["chk"].configure(state="normal" if dep_changed else "disabled")
                     if dep.get("selected_var"):
                         dep["selected_var"].set(dep_changed)
 
+        self._detect_duplicates(self.file_items)
         self._update_selection_status()
 
     def _toggle_all_checkboxes(self):
@@ -1265,11 +1680,30 @@ class MediaRenamerApp(ctk.CTk):
     def _update_selection_status(self):
         total_found = len(self.file_items)
         selected_count = 0
+        dup_count = sum(1 for itm in self.file_items if itm.get("is_duplicate"))
 
         for item in self.file_items:
             if item.get("status_override"):
                 if "status_label" in item:
                     item["status_label"].configure(text=item["status_override"], text_color="#E5A00D")
+                if item.get("is_selected") and item.get("will_rename"):
+                    selected_count += 1
+                continue
+
+            if item.get("is_duplicate"):
+                if "status_label" in item:
+                    if item.get("is_selected") and item.get("will_rename"):
+                        item["status_label"].configure(
+                            text=f"Duplicate ({item['duplicate_count']})",
+                            text_color="#E55353"
+                        )
+                    else:
+                        item["status_label"].configure(
+                            text="Duplicate (Skipped)",
+                            text_color="gray"
+                        )
+                if item.get("is_selected") and item.get("will_rename"):
+                    selected_count += 1
                 continue
 
             if not item["will_rename"]:
@@ -1280,16 +1714,25 @@ class MediaRenamerApp(ctk.CTk):
             if item["is_selected"]:
                 selected_count += 1
                 if "status_label" in item:
-                    item["status_label"].configure(text="Pending", text_color="#D29922")
+                    if item.get("is_new_folder"):
+                        st_text = "Pending (Create)"
+                    elif item.get("is_loose_move"):
+                        st_text = "Pending (Move)"
+                    else:
+                        st_text = "Pending"
+                    item["status_label"].configure(text=st_text, text_color="#D29922")
             else:
                 if "status_label" in item:
                     item["status_label"].configure(text="Skipped", text_color="gray")
 
         mode_desc = "TMDb + TVMaze" if self.tmdb_client.is_configured() else "TVMaze (Free) mode"
-        self.lbl_status.configure(
-            text=f"[{mode_desc}] {total_found} total item(s) scanned ({len(self.filtered_items)} shown). {selected_count} selected for rename."
-        )
+        status_text = f"[{mode_desc}] {total_found} total item(s) scanned ({len(self.filtered_items)} shown). {selected_count} selected for action."
+        if dup_count > 0:
+            status_text += f" | ⚠️ {dup_count} duplicate item(s) detected (Click 'Status ↕' to group)."
+        self.lbl_status.configure(text=status_text)
         self.btn_apply.configure(state="normal" if selected_count > 0 else "disabled")
+        if getattr(self, "btn_dedup", None):
+            self.btn_dedup.configure(state="normal" if dup_count > 0 else "disabled")
 
     def apply_renames(self):
         """Show confirmation dialog with breakdown before executing rename batch."""
@@ -1306,12 +1749,22 @@ class MediaRenamerApp(ctk.CTk):
         if not selected_items:
             return
 
-        breakdown = {"Folder": 0, "Video": 0, "Audio": 0, "Sub": 0}
+        breakdown = {"Folder": 0, "NewFolder": 0, "Video": 0, "Audio": 0, "Sub": 0}
         for itm in selected_items:
-            kind = itm.get("kind", "File")
+            if itm.get("is_new_folder"):
+                kind = "NewFolder"
+            else:
+                kind = itm.get("kind", "File")
             breakdown[kind] = breakdown.get(kind, 0) + 1
 
-        RenameConfirmDialog(self, breakdown, len(selected_items), on_confirm=self._execute_apply_renames)
+        dup_selected = sum(1 for itm in selected_items if itm.get("is_duplicate"))
+        RenameConfirmDialog(
+            self,
+            breakdown,
+            len(selected_items),
+            on_confirm=self._execute_apply_renames,
+            dup_count=dup_selected,
+        )
 
     def _execute_apply_renames(self):
         renamed_count = 0
@@ -1332,6 +1785,16 @@ class MediaRenamerApp(ctk.CTk):
         deferred_dirs = []
 
         for item in dir_renames:
+            if item.get("is_new_folder"):
+                dest_dir = item["folder_group"] / sanitize_filename(item["new_name"])
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    current_batch.append((dest_dir, None, True))
+                    renamed_count += 1
+                except Exception as err:
+                    error_details.append(f"[Create Folder] {dest_dir.name}: {err}")
+                continue
+
             src = item["path"]
             sanitized_new = sanitize_filename(item["new_name"]) if item["new_name"] else item["orig_name"]
             base_dest = src.parent / sanitized_new
@@ -1366,12 +1829,18 @@ class MediaRenamerApp(ctk.CTk):
         for item in file_renames:
             src = item["path"]
             sanitized_new = sanitize_filename(item["new_name"]) if item["new_name"] else item["orig_name"]
-            base_dest = src.parent / sanitized_new
-            dest = base_dest
 
+            if item.get("target_folder_name"):
+                target_dir = item["folder_group"] / sanitize_filename(item["target_folder_name"])
+                target_dir.mkdir(parents=True, exist_ok=True)
+                base_dest = target_dir / sanitized_new
+            else:
+                base_dest = src.parent / sanitized_new
+
+            dest = base_dest
             counter = 1
             while is_collision(dest, src):
-                dest = src.parent / f"{base_dest.stem}_{counter}{base_dest.suffix}"
+                dest = base_dest.parent / f"{base_dest.stem}_{counter}{base_dest.suffix}"
                 counter += 1
 
             try:
@@ -1382,6 +1851,8 @@ class MediaRenamerApp(ctk.CTk):
                 error_details.append(f"{src.name}: {err}")
 
         for item in deferred_dirs:
+            if item.get("is_new_folder"):
+                continue
             src = item["path"]
             sanitized_new = sanitize_filename(item["new_name"]) if item["new_name"] else item["orig_name"]
             base_dest = src.parent / sanitized_new
@@ -1456,6 +1927,17 @@ class MediaRenamerApp(ctk.CTk):
         remaining = list(reversed(self.last_rename_batch))
         for i, (current_path, original_path) in enumerate(remaining):
             try:
+                if original_path is None:
+                    # Created directory -> remove if empty
+                    if current_path.exists():
+                        try:
+                            if not any(current_path.iterdir()):
+                                current_path.rmdir()
+                                restored_count += 1
+                        except Exception:
+                            pass
+                    continue
+
                 if current_path.exists():
                     is_selected_root = bool(
                         self.selected_folder and str(current_path.resolve()).lower() == str(self.selected_folder.resolve()).lower()
@@ -1470,11 +1952,11 @@ class MediaRenamerApp(ctk.CTk):
                     if original_path.is_dir():
                         for j in range(i + 1, len(remaining)):
                             c_p, o_p = remaining[j]
-                            if c_p.is_relative_to(current_path):
+                            if c_p and c_p.is_relative_to(current_path):
                                 new_c_p = original_path / c_p.relative_to(current_path)
                             else:
                                 new_c_p = c_p
-                            if o_p.is_relative_to(current_path):
+                            if o_p and o_p.is_relative_to(current_path):
                                 new_o_p = original_path / o_p.relative_to(current_path)
                             else:
                                 new_o_p = o_p

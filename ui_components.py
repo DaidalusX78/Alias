@@ -14,40 +14,44 @@ import customtkinter as ctk
 
 from winfs import get_detected_drives
 
+PAPAYA_ACCENT = ("#E65100", "#FF7518")
+PAPAYA_HOVER = ("#CC4400", "#E65814")
+
 
 class CTkToolTip:
     """
-    Singleton-backed tooltip system.
-    Reuses a single persistent Toplevel window to eliminate window creation leaks and stuck tooltips.
+    Lightweight, reliable tooltip system.
+    Destroys the top-level window on dismiss to prevent stuck tooltips on Windows DWM.
     """
     _window: ctk.CTkToplevel | None = None
-    _label: ctk.CTkLabel | None = None
     _timer_id: str | None = None
     _current_widget: Any = None
 
     @classmethod
-    def hide_all(cls) -> None:
+    def hide_all(cls, event=None) -> None:
         if cls._timer_id and cls._current_widget:
             try:
                 cls._current_widget.after_cancel(cls._timer_id)
             except Exception:
                 pass
             cls._timer_id = None
-        if cls._window and cls._window.winfo_exists():
+        if cls._window is not None:
             try:
-                cls._window.withdraw()
+                if cls._window.winfo_exists():
+                    cls._window.destroy()
             except Exception:
                 pass
+            cls._window = None
         cls._current_widget = None
 
     def __init__(self, widget: Any, text: str):
         self.widget = widget
         self.text = text
-        self.widget.bind("<Enter>", self.show_tip)
-        self.widget.bind("<Leave>", self.hide_tip)
-        self.widget.bind("<ButtonPress>", self.hide_tip)
-        self.widget.bind("<FocusOut>", self.hide_tip)
-        self.widget.bind("<Destroy>", self.hide_tip)
+        self.widget.bind("<Enter>", self.show_tip, add="+")
+        self.widget.bind("<Leave>", self.hide_tip, add="+")
+        self.widget.bind("<ButtonPress>", self.hide_tip, add="+")
+        self.widget.bind("<FocusOut>", self.hide_tip, add="+")
+        self.widget.bind("<Destroy>", self.hide_tip, add="+")
 
     def show_tip(self, event=None) -> None:
         CTkToolTip.hide_all()
@@ -55,35 +59,38 @@ class CTkToolTip:
             return
         try:
             root = self.widget.winfo_toplevel()
-            if CTkToolTip._window is None or not CTkToolTip._window.winfo_exists():
-                CTkToolTip._window = tw = ctk.CTkToplevel(root)
-                tw.wm_overrideredirect(True)
-                tw.attributes("-topmost", True)
-                tw.withdraw()
-                CTkToolTip._label = lbl = ctk.CTkLabel(
-                    tw,
-                    text="",
-                    font=ctk.CTkFont(size=11),
-                    fg_color=("gray85", "gray20"),
-                    text_color=("gray10", "gray90"),
-                    corner_radius=6,
-                    padx=8,
-                    pady=4
-                )
-                lbl.pack()
-                tw.bind("<ButtonPress>", lambda e: CTkToolTip.hide_all())
-                lbl.bind("<ButtonPress>", lambda e: CTkToolTip.hide_all())
+            if not getattr(root, "_has_tooltip_dismiss_binding", False):
+                root.bind_all("<ButtonPress>", CTkToolTip.hide_all, add="+")
+                root.bind_all("<KeyPress>", CTkToolTip.hide_all, add="+")
+                root.bind_all("<MouseWheel>", CTkToolTip.hide_all, add="+")
+                root.bind("<Unmap>", CTkToolTip.hide_all, add="+")
+                root._has_tooltip_dismiss_binding = True
 
-            CTkToolTip._label.configure(text=self.text)
+            CTkToolTip._window = tw = ctk.CTkToplevel(root)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            lbl = ctk.CTkLabel(
+                tw,
+                text=self.text,
+                font=ctk.CTkFont(size=11),
+                fg_color=("gray85", "gray20"),
+                text_color=("gray10", "gray90"),
+                corner_radius=6,
+                padx=8,
+                pady=4
+            )
+            lbl.pack()
+            tw.bind("<ButtonPress>", CTkToolTip.hide_all)
+            lbl.bind("<ButtonPress>", CTkToolTip.hide_all)
+
             self.widget.update_idletasks()
             x = self.widget.winfo_rootx() + 15
             y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-            CTkToolTip._window.wm_geometry(f"+{x}+{y}")
-            CTkToolTip._window.deiconify()
+            tw.wm_geometry(f"+{x}+{y}")
             CTkToolTip._current_widget = self.widget
 
-            # Auto-dismiss after 3.5 seconds
-            CTkToolTip._timer_id = self.widget.after(3500, CTkToolTip.hide_all)
+            # Auto-dismiss after 1.5 seconds
+            CTkToolTip._timer_id = self.widget.after(1500, CTkToolTip.hide_all)
         except Exception:
             CTkToolTip.hide_all()
 
@@ -94,27 +101,34 @@ class CTkToolTip:
 class FolderTreeDropdown:
     """
     Interactive dropdown directory tree anchored to the Folder Path bar.
-    Opens exclusively via the dropdown toggle button (allowing full text selection/pasting in path bar).
-    Binds outside click detection only while open to prevent handler accumulation.
+    Opens via the dropdown toggle button. Closes immediately on outside clicks,
+    window minimization, focus loss, or Escape. Styled to match the dropdown menu theme.
     """
-    def __init__(self, parent: ctk.CTk, entry_widget: ctk.CTkEntry, on_select_callback: Callable[[str], None]):
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        entry_widget: ctk.CTkEntry,
+        on_select_callback: Callable[[str], None],
+        toggle_btn: ctk.CTkButton | None = None,
+    ):
         self.parent = parent
         self.entry_widget = entry_widget
         self.on_select_callback = on_select_callback
+        self.toggle_btn = toggle_btn
         self.popup: ctk.CTkToplevel | None = None
         self.tree: ttk.Treeview | None = None
-        self._click_binding_id: str | None = None
+        self._unmap_binding_id: str | None = None
 
     def is_open(self) -> bool:
         return self.popup is not None and self.popup.winfo_exists()
 
     def close(self) -> None:
-        if self._click_binding_id:
+        if self._unmap_binding_id:
             try:
-                self.parent.unbind("<Button-1>", self._click_binding_id)
+                self.parent.unbind("<Unmap>", self._unmap_binding_id)
             except Exception:
                 pass
-            self._click_binding_id = None
+            self._unmap_binding_id = None
 
         if self.popup and self.popup.winfo_exists():
             try:
@@ -136,23 +150,40 @@ class FolderTreeDropdown:
             self.parent.update_idletasks()
             x = self.entry_widget.winfo_rootx()
             y = self.entry_widget.winfo_rooty() + self.entry_widget.winfo_height() + 4
-            w = max(self.entry_widget.winfo_width(), 460)
-            h = 320
+            w = max(self.entry_widget.winfo_width() + 36, 460)
+            h = 300
 
             self.popup = tw = ctk.CTkToplevel(self.parent)
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"{w}x{h}+{x}+{y}")
             tw.attributes("-topmost", True)
 
-            border_frame = ctk.CTkFrame(tw, corner_radius=8, border_width=2, border_color=("gray60", "gray40"))
+            border_frame = ctk.CTkFrame(
+                tw,
+                corner_radius=8,
+                border_width=1,
+                border_color=("gray75", "#30363D"),
+                fg_color=("gray92", "#1C2128"),
+            )
             border_frame.pack(fill="both", expand=True)
 
             hdr = ctk.CTkFrame(border_frame, fg_color="transparent")
             hdr.pack(fill="x", padx=10, pady=(6, 2))
-            ctk.CTkLabel(hdr, text="Browse Folder Tree:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            ctk.CTkLabel(
+                hdr,
+                text="Browse Folder Tree:",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=("gray10", "gray95"),
+            ).pack(side="left")
             btn_close = ctk.CTkButton(
-                hdr, text="✕", width=24, height=20, fg_color="transparent",
-                hover_color=("gray80", "gray30"), command=self.close
+                hdr,
+                text="✕",
+                width=24,
+                height=20,
+                fg_color="transparent",
+                hover_color=("gray80", "gray30"),
+                text_color=("gray20", "gray80"),
+                command=self.close,
             )
             btn_close.pack(side="right")
 
@@ -160,9 +191,9 @@ class FolderTreeDropdown:
             tree_container.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
             is_dark = (ctk.get_appearance_mode().lower() == "dark")
-            bg_color = "#242424" if is_dark else "#F5F5F5"
-            fg_color = "#FFFFFF" if is_dark else "#1A1A1A"
-            select_bg = "#1F6AA5"
+            bg_color = "#1C2128" if is_dark else "#F6F8FA"
+            fg_color = "#C9D1D9" if is_dark else "#1A1A1A"
+            select_bg = PAPAYA_ACCENT[1] if is_dark else PAPAYA_ACCENT[0]
 
             style = ttk.Style(tw)
             style.theme_use("clam")
@@ -173,7 +204,7 @@ class FolderTreeDropdown:
                 fieldbackground=bg_color,
                 rowheight=24,
                 font=("Segoe UI", 10),
-                borderwidth=0
+                borderwidth=0,
             )
             style.map("FolderTree.Treeview", background=[("selected", select_bg)], foreground=[("selected", "#FFFFFF")])
 
@@ -201,7 +232,7 @@ class FolderTreeDropdown:
                         with os.scandir(dir_path) as it:
                             entries = sorted(
                                 [e for e in it if e.is_dir() and not e.name.startswith(("$", "."))],
-                                key=lambda e: e.name.lower()
+                                key=lambda e: e.name.lower(),
                             )
                             for sub in entries:
                                 sub_node = tree.insert(cur_node, "end", text=f"📁  {sub.name}", values=[sub.path], open=False)
@@ -227,12 +258,54 @@ class FolderTreeDropdown:
             action_bar = ctk.CTkFrame(border_frame, fg_color="transparent")
             action_bar.pack(fill="x", padx=10, pady=(0, 6))
 
-            btn_ok = ctk.CTkButton(action_bar, text="Select Folder", height=24, width=110, font=ctk.CTkFont(size=11, weight="bold"), command=do_choose)
+            btn_ok = ctk.CTkButton(
+                action_bar,
+                text="Select Folder",
+                height=26,
+                width=110,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color=PAPAYA_ACCENT,
+                hover_color=PAPAYA_HOVER,
+                command=do_choose,
+            )
             btn_ok.pack(side="right", padx=2)
 
             tw.bind("<Escape>", lambda e: self.close())
-            # Track outside clicks cleanly
-            self._click_binding_id = self.parent.bind("<Button-1>", self._check_click_outside, add="+")
+            tw.bind("<FocusOut>", self._check_focus_out)
+
+            if not getattr(self.parent, "_folder_tree_click_bound", False):
+                self.parent.bind_all("<Button-1>", self._check_click_outside, add="+")
+                self.parent.bind("<FocusOut>", self._check_focus_out, add="+")
+                self.parent._folder_tree_click_bound = True
+
+            self._unmap_binding_id = self.parent.bind(
+                "<Unmap>", lambda e: self.close() if e.widget == self.parent else None, add="+"
+            )
+        except Exception:
+            self.close()
+
+    def _check_focus_out(self, event=None):
+        if not self.is_open():
+            return
+        self.parent.after(120, self._verify_focus)
+
+    def _verify_focus(self):
+        if not self.is_open():
+            return
+        try:
+            focus_widget = self.parent.focus_get()
+            if focus_widget is None:
+                self.close()
+                return
+            curr = focus_widget
+            inside = False
+            while curr:
+                if curr == self.popup:
+                    inside = True
+                    break
+                curr = getattr(curr, "master", None)
+            if not inside and focus_widget not in (self.entry_widget, self.toggle_btn):
+                self.close()
         except Exception:
             self.close()
 
@@ -249,6 +322,16 @@ class FolderTreeDropdown:
             # Ignore clicks inside popup
             if px <= x <= px + pw and py <= y <= py + ph:
                 return
+
+            # Ignore clicks on toggle button so toggle() can handle it
+            if self.toggle_btn and self.toggle_btn.winfo_exists():
+                bx = self.toggle_btn.winfo_rootx()
+                by = self.toggle_btn.winfo_rooty()
+                bw = self.toggle_btn.winfo_width()
+                bh = self.toggle_btn.winfo_height()
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    return
+
             self.close()
         except Exception:
             self.close()
@@ -290,7 +373,7 @@ class ScanProgressDialog(ctk.CTkToplevel):
         )
         self.lbl_folder.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
 
-        self.progress = ctk.CTkProgressBar(self, mode="indeterminate")
+        self.progress = ctk.CTkProgressBar(self, mode="indeterminate", progress_color=PAPAYA_ACCENT)
         self.progress.grid(row=2, column=0, padx=20, pady=6, sticky="ew")
         self.progress.start()
         self._is_indeterminate = True
@@ -307,8 +390,8 @@ class ScanProgressDialog(ctk.CTkToplevel):
             self,
             text="Cancel Scan",
             width=110,
-            fg_color="#D9534F",
-            hover_color="#C9302C",
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
             command=self._handle_cancel
         )
         self.btn_cancel.grid(row=4, column=0, padx=20, pady=(0, 14), sticky="e")
@@ -344,17 +427,25 @@ class ScanProgressDialog(ctk.CTkToplevel):
 
 class RenameConfirmDialog(ctk.CTkToplevel):
     """Modal confirmation dialog showing breakdown by type before executing rename batch."""
-    def __init__(self, parent: ctk.CTk, breakdown: dict[str, int], total_count: int, on_confirm: Callable[[], None]):
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        breakdown: dict[str, int],
+        total_count: int,
+        on_confirm: Callable[[], None],
+        dup_count: int = 0,
+    ):
         super().__init__(parent)
         self.title("Confirm Batch Renaming")
-        self.geometry("460x230")
+        win_h = 250 if dup_count > 0 else 230
+        self.geometry(f"460x{win_h}")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self.update_idletasks()
         px = parent.winfo_rootx() + (parent.winfo_width() - 460) // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - 230) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - win_h) // 2
         self.geometry(f"+{max(px, 50)}+{max(py, 50)}")
 
         self.on_confirm = on_confirm
@@ -365,18 +456,22 @@ class RenameConfirmDialog(ctk.CTkToplevel):
             self,
             text=f"Apply Renaming to {total_count} item(s)?",
             font=ctk.CTkFont(size=16, weight="bold")
-        ).grid(row=0, column=0, padx=20, pady=(20, 8), sticky="w")
+        ).grid(row=0, column=0, padx=20, pady=(18, 6), sticky="w")
 
         # Breakdown summary
         parts: list[str] = []
+        if breakdown.get("NewFolder", 0):
+            parts.append(f"• {breakdown['NewFolder']} Folder(s) to create & move files into")
         if breakdown.get("Folder", 0):
-            parts.append(f"• {breakdown['Folder']} Folder(s)")
+            parts.append(f"• {breakdown['Folder']} Folder(s) to rename")
         if breakdown.get("Video", 0):
             parts.append(f"• {breakdown['Video']} Video file(s)")
         if breakdown.get("Audio", 0):
             parts.append(f"• {breakdown['Audio']} Audio track(s)")
         if breakdown.get("Sub", 0):
             parts.append(f"• {breakdown['Sub']} Subtitle (.srt) file(s)")
+        if dup_count > 0:
+            parts.append(f"⚠️ {dup_count} duplicate item(s) selected (one copy kept clean, others receive _1 suffixes)")
 
         summary_text = "\n".join(parts) if parts else "No items selected."
         ctk.CTkLabel(
@@ -411,8 +506,8 @@ class RenameConfirmDialog(ctk.CTkToplevel):
             text="Apply Renames",
             width=130,
             font=ctk.CTkFont(weight="bold"),
-            fg_color="#2EA043",
-            hover_color="#238636",
+            fg_color=PAPAYA_ACCENT,
+            hover_color=PAPAYA_HOVER,
             command=self._proceed
         ).pack(side="left")
 

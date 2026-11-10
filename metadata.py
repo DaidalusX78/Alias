@@ -71,8 +71,9 @@ class TMDbClient:
     BASE_URL = "https://api.themoviedb.org/3"
     MAX_CONSECUTIVE_FAILURES = 3
 
-    def __init__(self, api_key: str = ""):
+    def __init__(self, api_key: str = "", language: str = "en-US"):
         self.api_key = api_key.strip()
+        self.language = language or "en-US"
         self._cache: dict[str, Any] = {}
         self._session = requests.Session()
         self.consecutive_failures = 0
@@ -97,15 +98,16 @@ class TMDbClient:
         if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
             self.circuit_open = True
 
-    def search_tv_show(self, title: str) -> dict[str, Any] | None:
+    def search_tv_show(self, title: str, language: str | None = None) -> dict[str, Any] | None:
         if not self.is_configured() or not title:
             return None
-        cache_key = f"tv_{title.strip().lower()}"
+        lang = language or self.language or "en-US"
+        cache_key = f"tv_{title.strip().lower()}_{lang}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         url = f"{self.BASE_URL}/search/tv"
-        params = {"api_key": self.api_key, "query": title}
+        params = {"api_key": self.api_key, "query": title, "language": lang}
         try:
             resp = self._session.get(url, params=params, timeout=4)
             if resp.status_code == 200:
@@ -121,15 +123,18 @@ class TMDbClient:
         self._cache[cache_key] = None
         return None
 
-    def get_episode_details(self, show_id: int, season: int, episode: int) -> dict[str, Any] | None:
+    def get_episode_details(
+        self, show_id: int, season: int, episode: int, language: str | None = None
+    ) -> dict[str, Any] | None:
         if not self.is_configured() or not show_id:
             return None
-        cache_key = f"ep_{show_id}_{season}_{episode}"
+        lang = language or self.language or "en-US"
+        cache_key = f"ep_{show_id}_{season}_{episode}_{lang}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         url = f"{self.BASE_URL}/tv/{show_id}/season/{season}/episode/{episode}"
-        params = {"api_key": self.api_key}
+        params = {"api_key": self.api_key, "language": lang}
         try:
             resp = self._session.get(url, params=params, timeout=4)
             if resp.status_code == 200:
@@ -144,24 +149,87 @@ class TMDbClient:
         self._cache[cache_key] = None
         return None
 
-    def search_movie(self, title: str, year: str | None = None) -> dict[str, Any] | None:
+    @staticmethod
+    def _pick_best_movie_match(results: list[dict[str, Any]], target_year: str | None) -> dict[str, Any] | None:
+        if not results:
+            return None
+        if not target_year:
+            return results[0]
+
+        target_year = str(target_year).strip()
+        # 1. Exact primary release year match
+        for m in results:
+            rd = m.get("release_date", "")
+            if rd and len(rd) >= 4 and rd[:4] == target_year:
+                return m
+
+        # 2. Tolerant ±1 year match (handles festival vs theatrical or regional releases)
+        try:
+            y_int = int(target_year)
+            for m in results:
+                rd = m.get("release_date", "")
+                if rd and len(rd) >= 4:
+                    try:
+                        m_year = int(rd[:4])
+                        if abs(m_year - y_int) <= 1:
+                            return m
+                    except ValueError:
+                        pass
+
+            # 3. Tolerant ±2 years match
+            for m in results:
+                rd = m.get("release_date", "")
+                if rd and len(rd) >= 4:
+                    try:
+                        m_year = int(rd[:4])
+                        if abs(m_year - y_int) <= 2:
+                            return m
+                    except ValueError:
+                        pass
+        except ValueError:
+            pass
+
+        # If target year was explicitly specified and no result is within 2 years,
+        # do NOT pick an unrelated movie/sequel dated 5+ years away!
+        return None
+
+    def search_movie(
+        self, title: str, year: str | None = None, language: str | None = None
+    ) -> dict[str, Any] | None:
         if not self.is_configured() or not title:
             return None
-        cache_key = f"movie_{title.strip().lower()}_{year}"
+        lang = language or self.language or "en-US"
+        cache_key = f"movie_{title.strip().lower()}_{year}_{lang}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         url = f"{self.BASE_URL}/search/movie"
-        params: dict[str, Any] = {"api_key": self.api_key, "query": title}
+        params: dict[str, Any] = {"api_key": self.api_key, "query": title, "language": lang}
         if year:
-            params["year"] = year
+            params["primary_release_year"] = year
 
         try:
             resp = self._session.get(url, params=params, timeout=4)
             if resp.status_code == 200:
                 self._record_success()
                 results = resp.json().get("results", [])
-                res = results[0] if results else None
+
+                # If primary_release_year was too strict or returned no hits, fallback
+                if not results and year:
+                    fb_resp = self._session.get(
+                        url, params={"api_key": self.api_key, "query": title, "year": year, "language": lang}, timeout=4
+                    )
+                    if fb_resp.status_code == 200:
+                        results = fb_resp.json().get("results", [])
+
+                if not results and year:
+                    fb_resp = self._session.get(
+                        url, params={"api_key": self.api_key, "query": title, "language": lang}, timeout=4
+                    )
+                    if fb_resp.status_code == 200:
+                        results = fb_resp.json().get("results", [])
+
+                res = self._pick_best_movie_match(results, year)
                 self._cache[cache_key] = res
                 return res
             self._record_failure(resp.status_code)
